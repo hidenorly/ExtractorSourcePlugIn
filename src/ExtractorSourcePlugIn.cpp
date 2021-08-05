@@ -15,8 +15,15 @@
 */
 
 #include "ExtractorSourcePlugIn.hpp"
+#include "ExtractorPrimitive.hpp"
+#include "ParameterManager.hpp"
+#include "AudioFormatAdaptor.hpp"
+#include <filesystem>
+#include "Stream.hpp"
 
-ExtractorSource::ExtractorSource():SourcePlugIn()
+#define DEFAULT_CHUNK_SIZE 4096
+
+ExtractorSource::ExtractorSource():SourcePlugIn(), mFormat( AudioFormat::ENCODING::COMPRESSED ), mChunkSize(DEFAULT_CHUNK_SIZE)
 {
   for(int anEncoding = AudioFormat::ENCODING::PCM_8BIT; anEncoding < AudioFormat::ENCODING::COMPRESSED_UNKNOWN; anEncoding++){
     for( int aChannel = AudioFormat::CHANNEL::CHANNEL_MONO; aChannel < AudioFormat::CHANNEL::CHANNEL_UNKNOWN; aChannel++){
@@ -24,68 +31,96 @@ ExtractorSource::ExtractorSource():SourcePlugIn()
       mSupportedFormats.push_back( AudioFormat((AudioFormat::ENCODING)anEncoding, 96000, (AudioFormat::CHANNEL)aChannel) );
     }
   }
+
+  mParamKeyRoot = "source.extractor_"+std::to_string(mInstanceCount++);
+
+  ParameterManager* pParams = ParameterManager::getManager();
+  ParameterManager::CALLBACK callback = [&](std::string key, std::string value){
+    if( key ==  mParamKeyRoot+".path"){
+      std::cout << "[ExtractorSource] path=" << value << std::endl;
+      mPath = value;
+      open(value);
+    }
+  };
+  mCallbackId = pParams->registerCallback(mParamKeyRoot+".*", callback);
+
+  mFifoBuffer.setAudioFormat( mFormat );
 }
 
 ExtractorSource::~ExtractorSource()
 {
+  stop();
+  ParameterManager* pParams = ParameterManager::getManager();
+  pParams->unregisterCallback(mCallbackId);
+  mCallbackId = 0;
+  close();
+}
 
+bool ExtractorSource::open(std::string path)
+{
+  bool result = std::filesystem::exists( path );
+  if( result ){
+    mPath = path;
+    mMutexStream.lock();
+    mpStream = std::make_shared<FileStream>(path);
+    mMutexStream.unlock();
+  }
+  return result;
+}
+
+void ExtractorSource::open(std::shared_ptr<IStream> pStream)
+{
+  mMutexStream.lock();
+  mpStream = pStream;
+  mMutexStream.unlock();
+}
+
+
+void ExtractorSource::close(void)
+{
+  if( mpStream ){
+    mMutexStream.lock();
+    mpStream->close();
+    mMutexStream.unlock();
+    mpStream.reset();
+  }
 }
 
 bool ExtractorSource::isAvailableFormat(AudioFormat format)
 {
-  return format.isEncodingPcm();
+  return true;
+}
+
+void ExtractorSource::parse(ByteBuffer& inStreamBuf, IAudioBuffer& dstAudioBuf)
+{
+  ExtractorPrimitive::parse( inStreamBuf, dstAudioBuf);
+}
+
+void ExtractorSource::process(void)
+{
+  while( mbIsRunning && mpStream && !mpStream->isEndOfStream() ){
+    CompressAudioBuffer buf( mFormat, mChunkSize );
+    mFifoBuffer.setAudioFormat( mFormat );
+    ByteBuffer rawBuf = buf.getRawBuffer();
+    mMutexStream.lock();
+    mpStream->read( rawBuf );
+    mMutexStream.unlock();
+    buf.setRawBuffer( rawBuf );
+    mFifoBuffer.write( buf );
+  }
 }
 
 void ExtractorSource::readPrimitive(IAudioBuffer& buf)
 {
-  ByteBuffer esRawBuf( buf.getRawBuffer().size(), 0 );
-  AudioBuffer* pBuf = dynamic_cast<AudioBuffer*>(&buf);
-  static const float pi = 3.141592653589793f;
-  if( pBuf ){
-    AudioFormat format = pBuf->getAudioFormat();
-    int nChannels = format.getNumberOfChannels();
-    int nSamples = pBuf->getNumberOfSamples();
-
-    int8_t* pVal8 = reinterpret_cast<int8_t*>(esRawBuf.data());
-    int16_t* pVal16 = reinterpret_cast<int16_t*>(pVal8);
-    int32_t* pVal32 = reinterpret_cast<int32_t*>(pVal8);
-    float* pValFloat = reinterpret_cast<float*>(pVal8);
-
-    for(int n = 0; n < nSamples; n++ ){
-      float val = std::sin( 2 * pi * n / nSamples );
-      int offset = n * nChannels;
-      for( int c = 0; c < nChannels; c++ ){
-        switch( format.getEncoding() ){
-          case AudioFormat::ENCODING::PCM_8BIT:
-            * (pVal8+offset+c) = (int8_t)( (float)INT8_MAX * val );
-            break;
-          case AudioFormat::ENCODING::PCM_16BIT:
-            * (pVal16+offset+c) = (int8_t)( (float)INT16_MAX * val );
-            break;
-          case AudioFormat::ENCODING::PCM_32BIT:
-            * (pVal32+offset+c) = (int32_t)( (float)INT32_MAX * val );
-            break;
-          case AudioFormat::ENCODING::PCM_24BIT_PACKED:
-            {
-              int32_t tmp = (int32_t)( (float)INT32_MAX * val );
-              *(pVal8+offset+c+0) = (uint8_t)((tmp & 0x0000FF00) >> 8);
-              *(pVal8+offset+c+1) = (uint8_t)((tmp & 0x00FF0000) >> 16);
-              *(pVal8+offset+c+2) = (uint8_t)((tmp & 0xFF000000) >> 24);
-            }
-            break;
-          case AudioFormat::ENCODING::PCM_FLOAT:
-            *(pValFloat+offset+c) = val;
-            break;
-          case AudioFormat::ENCODING::PCM_UNKNOWN:
-          default:
-            offset = 0;
-            break;
-        }
-      }
-    }
+  if( !mbIsRunning && mpStream && !mpStream->isEndOfStream() ){
+    run();
+    CompressAudioBuffer inBuf( mFormat, mChunkSize );
+    mFifoBuffer.read( inBuf );
+    buf.setRawBuffer( inBuf.getRawBuffer() );
+    parse( inBuf.getRawBuffer(), buf );
+  } else {
+    stop();
   }
-  buf.setRawBuffer( esRawBuf );
-  buf.setAudioFormat( mFormat );
 }
 
 
